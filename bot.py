@@ -53,6 +53,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Prevent request URLs (which contain the Telegram bot token) from appearing
+# in normal Railway logs. Keep the application logger at INFO for diagnostics.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 
 # ---------------------- database ----------------------
 def _pool_connection() -> pg_pool.ThreadedConnectionPool:
