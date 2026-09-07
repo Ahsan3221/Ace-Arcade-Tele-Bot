@@ -22,7 +22,6 @@ STAFF_TABLE = "ace_arcade_staff"
 
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SUPPORT_GROUP_ID = int(os.getenv("SUPPORT_GROUP_ID", "0") or 0)
-PRIVACY_POLICY_URL = os.getenv("PRIVACY_POLICY_URL", "").strip()
 _staff = os.getenv("AUTHORIZED_STAFF_IDS", "")
 AUTHORIZED_STAFF = {
     int(value.strip()) for value in _staff.split(",")
@@ -216,15 +215,6 @@ async def db_remove_staff(user_id: int) -> None:
     def query(cursor):
         cursor.execute(f"DELETE FROM {STAFF_TABLE} WHERE user_id = %s", (user_id,))
     await asyncio.to_thread(_run, query)
-
-
-async def db_delete_user(user_id: int) -> int | None:
-    def query(cursor):
-        cursor.execute(f"SELECT topic_id FROM {USERS_TABLE} WHERE user_id = %s", (user_id,))
-        row = cursor.fetchone()
-        cursor.execute(f"DELETE FROM {USERS_TABLE} WHERE user_id = %s", (user_id,))
-        return row["topic_id"] if row else None
-    return await asyncio.to_thread(_run, query)
 
 
 # ---------------------- shared helpers ----------------------
@@ -500,51 +490,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"ℹ️ {BRAND.upper()} SUPPORT — HELP\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "/start       — Begin or restart your support chat\n"
             "/games       — Choose or change your game\n"
-            "/support     — Reach our support team\n"
-            "/privacy     — View privacy information\n"
-            "/delete_data — Delete this bot's database record\n"
-            "/help        — Show this message\n\n"
+            "/support — Reach our support team\n"
+            "/help    — Show this message\n\n"
             "💬 You can also send a message anytime — our team will reply here."
         )
-
-
-async def privacy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    if PRIVACY_POLICY_URL:
-        text = f"🔒 {BRAND} Privacy\n\nRead our policy:\n{PRIVACY_POLICY_URL}\n\nFor questions, use /support."
-    else:
-        text = f"🔒 {BRAND} Privacy\n\nThe public policy link is not configured yet. Please use /support."
-    await update.message.reply_text(text)
-
-
-async def delete_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user:
-        return
-    user = update.effective_user
-    try:
-        topic_id = await db_delete_user(user.id)
-        if topic_id:
-            try:
-                await context.bot.send_message(
-                    chat_id=SUPPORT_GROUP_ID, message_thread_id=topic_id,
-                    text=("🗑 CUSTOMER REQUESTED DATA DELETION\n\n"
-                          "The bot database record and topic mapping were removed. "
-                          "Review any Telegram conversation under your retention process."),
-                )
-                await context.bot.close_forum_topic(
-                    chat_id=SUPPORT_GROUP_ID, message_thread_id=topic_id
-                )
-            except TelegramError:
-                pass
-        await update.message.reply_text(
-            "✅ Your record has been removed from this bot's database.\n\n"
-            "Telegram chat history may be retained by Telegram or support participants. "
-            "Use /support for any follow-up request."
-        )
-    except Exception:
-        logger.exception("Data deletion failed for %s", user.id)
-        await update.message.reply_text("⚠️ Deletion could not be completed. Please use /support.")
 
 
 async def bonus_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -845,8 +794,6 @@ async def post_init(application: Application) -> None:
         BotCommand("help", "Show help and available commands"),
         BotCommand("games", "Choose or change your game"),
         BotCommand("support", "Reach the support team"),
-        BotCommand("privacy", "View privacy information"),
-        BotCommand("delete_data", "Delete your bot database record"),
     ]
     await application.bot.set_my_commands(public)
     group_commands = public + [
@@ -883,8 +830,6 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("games", games))
     application.add_handler(CommandHandler("support", support))
-    application.add_handler(CommandHandler("privacy", privacy))
-    application.add_handler(CommandHandler("delete_data", delete_data, filters=filters.ChatType.PRIVATE))
     application.add_handler(CallbackQueryHandler(bonus_selected, pattern=r"^bonus:"))
     application.add_handler(CallbackQueryHandler(game_selected, pattern=r"^game:"))
     group = filters.Chat(chat_id=SUPPORT_GROUP_ID)
