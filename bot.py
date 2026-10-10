@@ -17,6 +17,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
 from psycopg2 import IntegrityError
 from settings import BRAND, Config, GAMES, BONUS_OPTIONS, LABELS
 from crm import (parse_game, parse_source, normalize_game, normalize_label,
+                 parse_account_template,
                  normalize_workflow, safe_username, topic_title, profile_text,
                  retry_delay, is_permanent_error, is_topic_missing, short)
 from database import Database
@@ -443,11 +444,31 @@ async def group_message(update,context):
     row=await s.db.by_topic(tid)
     if not row:
         return
+    uid=int(row['user_id'])
     try:
-        await enqueue_incoming(s,int(row['user_id']),'staff',msg)
+        await enqueue_incoming(s,uid,'staff',msg)
     except Exception:
         log.exception('Could not queue staff message id=%s',msg.message_id)
         await msg.reply_text('⚠️ Message NOT queued; please retry.')
+        return
+    # Capture only outbound human-staff messages that have BOTH Username and
+    # Password lines and a recognizable suffix or an explicit Game: line.
+    # The normal staff message still goes to the player through the outbox.
+    account=parse_account_template(msg.text or msg.caption or '')
+    if account:
+        try:
+            duplicates=await s.db.set_account(
+                uid,account.game,account.username,msg.from_user.id,
+                password=account.password,source_chat=msg.chat.id,source_message=msg.message_id)
+            if duplicates is not None:  # Skip repeated delivery of the same Telegram update.
+                await refresh_profile(s,context.bot,uid)
+                acknowledgement=f'✅ Auto-saved {account.game}: {account.username} (password stored)'
+                if duplicates:
+                    acknowledgement+='\n⚠️ Another customer has the same game account.'
+                await msg.reply_text(acknowledgement)
+        except Exception:
+            log.exception('Account auto-save failed group_message_id=%s',msg.message_id)
+            await msg.reply_text('⚠️ Account message queued, but automatic account saving failed. You can retry with /setaccount.')
 
 
 async def show_profile(update,context):
@@ -469,27 +490,35 @@ async def edit_profile(update,context,action):
     actor=update.effective_user.id
     try:
         if action=='setaccount':
-            if len(args)!=2:
-                raise ValueError('Usage: /setaccount <Game> <username>')
-            game=normalize_game(args[0]); account=safe_username(args[1])
-            duplicates=await s.db.set_account(uid,game,account,actor)
+            # Both /setaccount Juwa player123 009988 and
+            # /setaccount Cash Master | player123 | 009988 work.
+            raw=' '.join(args).strip()
+            fields=[v.strip() for v in raw.split('|')] if '|' in raw else args
+            if len(fields) not in (2,3) or not all(fields):
+                raise ValueError('Usage: /setaccount <Game> <username> [password] OR /setaccount <Game Name> | <username> | <password>')
+            game=normalize_game(fields[0]); account=safe_username(fields[1])
+            password=fields[2] if len(fields)==3 else None
+            if password is not None and (len(password)>256 or any(ord(c)<32 for c in password)):
+                raise ValueError('Password must contain 1-256 printable characters')
+            duplicates=await s.db.set_account(uid,game,account,actor,password=password)
             message=f'✅ Saved {game} account: {account}'
             if duplicates:
                 message+=f'\n⚠️ Same game account is linked to customer IDs: {", ".join(map(str,duplicates))}'
         elif action=='delaccount':
-            if len(args)!=1:
-                raise ValueError('Usage: /delaccount <Game>')
-            game=normalize_game(args[0])
+            if not args:
+                raise ValueError('Usage: /delaccount <Game Name>')
+            game=normalize_game(' '.join(args))
             if not await s.db.delete_account(uid,game,actor):
                 await update.message.reply_text('Account was not found.')
                 return
             message=f'✅ Removed saved {game} account.'
         elif action in ('label','unlabel'):
-            if len(args)!=1:
-                raise ValueError(f'Usage: /{action} <VIP|Depositor|Regular|Freeplay|New>')
-            label=normalize_label(args[0])
-            await s.db.set_label(uid,label,actor,remove=(action=='unlabel'))
-            message=f'✅ Label {label} {"removed" if action=="unlabel" else "saved"}.'
+            if not args:
+                raise ValueError(f'Usage: /{action} <any label text> — e.g. /label High Roller')
+            custom=' '.join(args)
+            label=normalize_label(custom)
+            await s.db.set_label(uid,label,actor,remove=(action=='unlabel'),display=custom)
+            message=f'✅ Label {custom.strip()} {"removed" if action=="unlabel" else "saved"}.'
         elif action=='note':
             body=' '.join(args).strip()
             if not body or len(body)>500:
@@ -497,9 +526,9 @@ async def edit_profile(update,context,action):
             await s.db.note(uid,body,actor)
             message='✅ Staff note saved (visible only to authorized staff).'
         elif action=='status':
-            if len(args)!=1:
-                raise ValueError('Usage: /status <new|pending|in_progress|resolved>')
-            value=normalize_workflow(args[0]); await s.db.workflow(uid,value,actor)
+            if not args:
+                raise ValueError('Usage: /status <any status name>')
+            value=normalize_workflow(' '.join(args)); await s.db.workflow(uid,value,actor)
             message=f'✅ Workflow status updated: {value}'
         elif action=='assign':
             if len(args)!=1 or (args[0].lower()!='none' and not args[0].isdigit()):
@@ -539,12 +568,28 @@ async def cmd_assign(u,c): await edit_profile(u,c,'assign')
 async def cmd_deposit(u,c): await edit_profile(u,c,'deposit')
 
 
+async def show_accounts(update,context):
+    """Detailed view; pinned profiles intentionally only show game usernames."""
+    row=await topic_customer(update,context)
+    if not row:
+        return
+    accounts=await state(context).db.account_details(int(row['user_id']))
+    if not accounts:
+        await update.message.reply_text('No game accounts saved yet.')
+        return
+    lines=['🔐 SAVED GAME ACCOUNTS — '+short(row['name'],60)]
+    for a in accounts:
+        lines += [f"\n🎮 {a['game']}",f"👤 Username: {a['account_username']}",
+                  f"🔑 Password: {a['account_password'] if a['account_password'] is not None else '(not saved)'}"]
+    await update.message.reply_text('\n'.join(lines)[:3950])
+
+
 async def find_account(update,context):
     if not await authorize(update,context): return
-    if len(context.args or [])!=1:
+    if not (context.args or []):
         await update.message.reply_text('Usage: /findaccount <game_username>')
         return
-    term=context.args[0]
+    term=' '.join(context.args).strip().lstrip('@')
     matches=await state(context).db.find_account(term)
     if not matches:
         await update.message.reply_text('No saved account matches.')
@@ -788,7 +833,8 @@ async def post_init(app):
     await app.bot.set_my_commands(public)
     commands=[BotCommand('profile','Customer profile'),BotCommand('id','Customer profile'),
               BotCommand('setaccount','Save game account'),BotCommand('delaccount','Remove game account'),
-              BotCommand('findaccount','Find saved username'),BotCommand('label','Add VIP or other label'),
+              BotCommand('findaccount','Find saved username'),BotCommand('accounts','View usernames and passwords'),
+              BotCommand('label','Add any custom label'),
               BotCommand('unlabel','Remove a label'),BotCommand('note','Add staff note'),
               BotCommand('history','Customer audit log'),BotCommand('status','Change workflow status'),
               BotCommand('assign','Assign employee'),BotCommand('use','Send saved reply'),
@@ -835,7 +881,7 @@ def build_app(cfg=None,db=None):
     app.add_handler(CallbackQueryHandler(delete_callback,pattern=r'^delete:(yes|no):\d+$'))
     app.add_handler(CallbackQueryHandler(broadcast_callback,pattern=r'^bc:(yes|no):\d+$'))
     staff_commands={
-        'profile':show_profile,'id':show_profile,'setaccount':cmd_setaccount,
+        'profile':show_profile,'id':show_profile,'accounts':show_accounts,'setaccount':cmd_setaccount,
         'delaccount':cmd_delaccount,'findaccount':find_account,'label':cmd_label,
         'unlabel':cmd_unlabel,'note':cmd_note,'history':show_history,
         'status':cmd_status,'assign':cmd_assign,'deposit':cmd_deposit,

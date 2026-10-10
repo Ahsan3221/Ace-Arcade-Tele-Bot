@@ -1,11 +1,12 @@
 """Configuration and validation for the Ace Arcade support bot."""
 import os
+import logging
 
 BRAND = "Ace Arcade"
 PREFIX = "ace_arcade"
 GAMES = (
     "Orionstars", "Firekirin", "Ultrapanda", "Juwa", "GameVault",
-    "Riversweeps", "Milkyway", "Vblink", "Gameroom",
+    "Riversweeps", "Milkyway", "Vblink", "Gameroom", "CashMaster",
 )
 TRAFFIC_SOURCES = {"website": "🌐 Website", "facebook": "📘 Facebook"}
 BONUS_OPTIONS = {
@@ -34,8 +35,8 @@ class Config:
         self.token = os.getenv("BOT_TOKEN", "").strip()
         self.group_id = int(os.getenv("SUPPORT_GROUP_ID", "0") or "0")
         self.db_url = os.getenv("DATABASE_URL", "").strip()
-        self.owner_ids = env_ids("OWNER_IDS")
         self.seed_staff = env_ids("AUTHORIZED_STAFF_IDS")
+        self.owner_ids = env_ids("OWNER_IDS")
         self.privacy_url = os.getenv("PRIVACY_POLICY_URL", "").strip()
         self.retention_days = positive_int("RETENTION_DAYS", "0")
         self.broadcast_gap = max(0.1, float(os.getenv("BROADCAST_GAP_SECONDS", "0.15")))
@@ -48,6 +49,4 @@ class Config:
             raise RuntimeError("SUPPORT_GROUP_ID is missing")
         if not self.db_url:
             raise RuntimeError("DATABASE_URL is missing")
-        # Keep support service online on first deployment if OWNER_IDS has not
-        # yet been configured on Railway. Owner-only commands stay disabled.
-        # Set OWNER_IDS before using admin or broadcast commands.
+        # Legacy apps may have no OWNER_IDS yet. Avoid crashing on upgrade.

@@ -17,6 +17,7 @@ H = "ace_arcade_activity"
 O = "ace_arcade_outbox"
 Q = "ace_arcade_shortcuts"
 B = "ace_arcade_broadcasts"
+C = "ace_arcade_account_captures"
 
 
 class Database:
@@ -64,6 +65,7 @@ class Database:
                 ("source", "TEXT"), ("bonus", "TEXT"),
                 ("topic_status", "TEXT NOT NULL DEFAULT 'open'"),
                 ("primary_label", "TEXT NOT NULL DEFAULT 'new'"),
+                ("primary_label_display", "TEXT"),
                 ("workflow_status", "TEXT NOT NULL DEFAULT 'new'"),
                 ("assigned_staff", "BIGINT"),
                 ("profile_message_id", "BIGINT"),
@@ -82,11 +84,19 @@ class Database:
                 id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES {U}(user_id) ON DELETE CASCADE,
                 game TEXT NOT NULL, account_username TEXT NOT NULL, changed_by BIGINT NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE (user_id,game))""")
+            cur.execute(f"ALTER TABLE {A} ADD COLUMN IF NOT EXISTS account_password TEXT")
             cur.execute(f"CREATE INDEX IF NOT EXISTS ace_arcade_accounts_lookup ON {A}(LOWER(account_username))")
+            cur.execute(f"""CREATE TABLE IF NOT EXISTS {C} (
+                source_chat_id BIGINT NOT NULL, source_message_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL REFERENCES {U}(user_id) ON DELETE CASCADE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY(source_chat_id, source_message_id))""")
             cur.execute(f"""CREATE TABLE IF NOT EXISTS {L} (
                 user_id BIGINT NOT NULL REFERENCES {U}(user_id) ON DELETE CASCADE,
                 label TEXT NOT NULL, changed_by BIGINT NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(user_id,label))""")
+            cur.execute(f"ALTER TABLE {L} ADD COLUMN IF NOT EXISTS label_display TEXT")
+            cur.execute(f"UPDATE {L} SET label_display=label WHERE label_display IS NULL")
             cur.execute(f"CREATE INDEX IF NOT EXISTS ace_arcade_labels_lookup ON {L}(label)")
             cur.execute(f"""CREATE TABLE IF NOT EXISTS {N} (
                 id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES {U}(user_id) ON DELETE CASCADE,
@@ -203,8 +213,8 @@ class Database:
         def fn(cur):
             cur.execute(f"SELECT game,account_username FROM {A} WHERE user_id=%s ORDER BY game",(user_id,))
             accounts=cur.fetchall()
-            cur.execute(f"SELECT label FROM {L} WHERE user_id=%s ORDER BY label",(user_id,))
-            labels=[x['label'] for x in cur.fetchall()]
+            cur.execute(f"SELECT label,label_display FROM {L} WHERE user_id=%s ORDER BY label",(user_id,))
+            labels=cur.fetchall()
             cur.execute(f"SELECT body,author_id,created_at FROM {N} WHERE user_id=%s ORDER BY id DESC LIMIT 3",(user_id,))
             notes=cur.fetchall()
             cur.execute(f"SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount FROM {D} WHERE user_id=%s",(user_id,))
@@ -212,20 +222,55 @@ class Database:
             return accounts,labels,notes,deposits
         return await self.call(fn)
 
-    async def set_account(self, uid, game, account, actor):
+    async def set_account(self, uid, game, account, actor, password=None, source_chat=None, source_message=None):
+        """Manual or idempotent automatic save. Password is plaintext by request."""
         def fn(cur):
-            cur.execute(f"SELECT user_id FROM {A} WHERE LOWER(account_username)=LOWER(%s) AND game=%s AND user_id<>%s LIMIT 10", (account,game,uid))
+            # Serialize updates to the same user's account list, including casing variants.
+            cur.execute(f"SELECT user_id FROM {U} WHERE user_id=%s FOR UPDATE", (uid,))
+            if not cur.fetchone():
+                raise ValueError('Customer record does not exist')
+            if source_chat is not None and source_message is not None:
+                cur.execute(f"""INSERT INTO {C}(source_chat_id, source_message_id, user_id)
+                    VALUES(%s,%s,%s) ON CONFLICT DO NOTHING RETURNING source_message_id""",
+                    (source_chat,source_message,uid))
+                if not cur.fetchone():
+                    return None  # This staff message has already been captured.
+            cur.execute(f"""SELECT DISTINCT user_id FROM {A}
+                WHERE LOWER(account_username)=LOWER(%s) AND LOWER(game)=LOWER(%s)
+                  AND user_id<>%s LIMIT 10""", (account,game,uid))
             duplicates=[int(x['user_id']) for x in cur.fetchall()]
-            cur.execute(f"""INSERT INTO {A}(user_id,game,account_username,changed_by) VALUES(%s,%s,%s,%s)
-                ON CONFLICT(user_id,game) DO UPDATE SET account_username=EXCLUDED.account_username,
-                changed_by=EXCLUDED.changed_by,updated_at=NOW()""",(uid,game,account,actor))
-            self._audit(cur,uid,actor,'set_account',f'{game}: {account}')
+            cur.execute(f"""SELECT id,account_username,account_password FROM {A}
+                WHERE user_id=%s AND LOWER(game)=LOWER(%s)
+                ORDER BY updated_at DESC,id DESC LIMIT 1 FOR UPDATE""", (uid,game))
+            current=cur.fetchone()
+            if current:
+                # Preserve prior password only for the very same username if no new one was supplied.
+                replacement_password=(password if password is not None else
+                    current['account_password'] if current['account_username'].casefold()==account.casefold() else None)
+                cur.execute(f"""UPDATE {A}
+                    SET game=%s, account_username=%s, account_password=%s,
+                        changed_by=%s, updated_at=NOW()
+                    WHERE id=%s""", (game,account,replacement_password,actor,current['id']))
+            else:
+                cur.execute(f"""INSERT INTO {A}(user_id,game,account_username,account_password,changed_by)
+                    VALUES(%s,%s,%s,%s,%s)""",(uid,game,account,password,actor))
+            # Show the latest game in the customer profile.
+            cur.execute(f"UPDATE {U} SET game=%s WHERE user_id=%s", (game,uid))
+            self._audit(cur,uid,actor,'auto_account' if source_message is not None else 'set_account',
+                        f'{game}: {account}')  # Intentionally omit plaintext password from audit/logs.
             return duplicates
+        return await self.call(fn)
+
+    async def account_details(self, uid):
+        def fn(cur):
+            cur.execute(f"""SELECT game,account_username,account_password,updated_at
+                FROM {A} WHERE user_id=%s ORDER BY game""",(uid,))
+            return cur.fetchall()
         return await self.call(fn)
 
     async def delete_account(self,uid,game,actor):
         def fn(cur):
-            cur.execute(f"DELETE FROM {A} WHERE user_id=%s AND game=%s RETURNING id",(uid,game))
+            cur.execute(f"DELETE FROM {A} WHERE user_id=%s AND LOWER(game)=LOWER(%s) RETURNING id",(uid,game))
             deleted=bool(cur.fetchone())
             if deleted:
                 self._audit(cur,uid,actor,'delete_account',game)
@@ -240,17 +285,28 @@ class Database:
             return cur.fetchall()
         return await self.call(fn)
 
-    async def set_label(self,uid,label,actor,remove=False):
+    async def set_label(self,uid,label,actor,remove=False,display=None):
+        """Label key is lower/casefolded, display retains user's custom capitalization."""
+        from crm import label_display as format_label
+        shown=format_label(label,display)
         def fn(cur):
             if remove:
-                cur.execute(f"DELETE FROM {L} WHERE user_id=%s AND label=%s",(uid,label))
+                cur.execute(f"DELETE FROM {L} WHERE user_id=%s AND LOWER(label)=LOWER(%s)",(uid,label))
             else:
-                cur.execute(f"""INSERT INTO {L}(user_id,label,changed_by) VALUES(%s,%s,%s)
-                    ON CONFLICT(user_id,label) DO UPDATE SET changed_by=EXCLUDED.changed_by,updated_at=NOW()""",(uid,label,actor))
-            cur.execute(f"SELECT label FROM {L} WHERE user_id=%s ORDER BY CASE label WHEN 'vip' THEN 0 WHEN 'depositor' THEN 1 WHEN 'regular' THEN 2 WHEN 'freeplay' THEN 3 ELSE 4 END LIMIT 1",(uid,))
-            row=cur.fetchone()
-            primary=row['label'] if row else 'new'
-            cur.execute(f"UPDATE {U} SET primary_label=%s WHERE user_id=%s",(primary,uid))
+                cur.execute(f"""INSERT INTO {L}(user_id,label,label_display,changed_by)
+                    VALUES(%s,%s,%s,%s) ON CONFLICT(user_id,label) DO UPDATE
+                    SET label_display=EXCLUDED.label_display,
+                        changed_by=EXCLUDED.changed_by, updated_at=NOW()""",(uid,label,shown,actor))
+            if not remove:
+                primary=label; primary_display=shown
+            else:
+                cur.execute(f"""SELECT label,label_display FROM {L} WHERE user_id=%s
+                    ORDER BY updated_at DESC,label LIMIT 1""",(uid,))
+                row=cur.fetchone()
+                primary=row['label'] if row else 'new'
+                primary_display=format_label(row['label'],row['label_display']) if row else None
+            cur.execute(f"UPDATE {U} SET primary_label=%s,primary_label_display=%s WHERE user_id=%s",
+                        (primary,primary_display,uid))
             self._audit(cur,uid,actor,'remove_label' if remove else 'add_label',label)
             return primary
         return await self.call(fn)
@@ -279,12 +335,13 @@ class Database:
     async def deposit(self,uid,amount,reference,actor):
         def fn(cur):
             cur.execute(f"INSERT INTO {D}(user_id,amount,reference,entered_by) VALUES(%s,%s,%s,%s)",(uid,amount,reference,actor))
-            # Manually recorded deposit also classifies the customer as Depositor.
-            cur.execute(f"""INSERT INTO {L}(user_id,label,changed_by) VALUES(%s,'depositor',%s)
+            # Keep existing custom/VIP primary label; add Depositor as secondary tag.
+            cur.execute(f"""INSERT INTO {L}(user_id,label,label_display,changed_by)
+                VALUES(%s,'depositor','💰 Depositor',%s)
                 ON CONFLICT(user_id,label) DO UPDATE SET changed_by=EXCLUDED.changed_by,updated_at=NOW()""",(uid,actor))
-            cur.execute(f"SELECT label FROM {L} WHERE user_id=%s ORDER BY CASE label WHEN 'vip' THEN 0 WHEN 'depositor' THEN 1 WHEN 'regular' THEN 2 WHEN 'freeplay' THEN 3 ELSE 4 END LIMIT 1",(uid,))
-            best=cur.fetchone()
-            cur.execute(f"UPDATE {U} SET primary_label=%s WHERE user_id=%s",(best['label'] if best else 'new',uid))
+            cur.execute(f"""UPDATE {U} SET primary_label='depositor',
+                primary_label_display='💰 Depositor'
+                WHERE user_id=%s AND (primary_label IS NULL OR primary_label='new')""",(uid,))
             self._audit(cur,uid,actor,'record_deposit',f'Amount {amount}, reference {reference}')
         await self.call(fn)
 
@@ -388,7 +445,7 @@ class Database:
             cur.execute(f"INSERT INTO {B}(author_id,body,label) VALUES(%s,%s,%s) RETURNING id",(author,body,label))
             draft=cur.fetchone()['id']
             if label:
-                cur.execute(f"SELECT COUNT(*) c FROM {U} WHERE marketing_opt_in AND EXISTS(SELECT 1 FROM {L} WHERE user_id={U}.user_id AND label=%s)",(label,))
+                cur.execute(f"SELECT COUNT(*) c FROM {U} WHERE marketing_opt_in AND EXISTS(SELECT 1 FROM {L} WHERE user_id={U}.user_id AND LOWER(label)=LOWER(%s))",(label,))
             else:
                 cur.execute(f"SELECT COUNT(*) c FROM {U} WHERE marketing_opt_in")
             return draft,cur.fetchone()['c']
@@ -406,7 +463,7 @@ class Database:
             cur.execute(f"UPDATE {B} SET state='queued',confirmed_at=NOW() WHERE id=%s",(bid,))
             label=row['label']
             if label:
-                cur.execute(f"SELECT user_id,name FROM {U} WHERE marketing_opt_in AND EXISTS(SELECT 1 FROM {L} WHERE user_id={U}.user_id AND label=%s)",(label,))
+                cur.execute(f"SELECT user_id,name FROM {U} WHERE marketing_opt_in AND EXISTS(SELECT 1 FROM {L} WHERE user_id={U}.user_id AND LOWER(label)=LOWER(%s))",(label,))
             else:
                 cur.execute(f"SELECT user_id,name FROM {U} WHERE marketing_opt_in")
             customers=cur.fetchall()

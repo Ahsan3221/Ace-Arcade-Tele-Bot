@@ -31,3 +31,20 @@
 - Privacy/retention policies, backup controls and access reviews must match actual business practices.
 - External payment verification cannot happen without a properly authenticated payment provider. Recording a deposit in the bot is only staff-entered history.
 - A Meta Business Suite-style web UI and AI-generated replies are separate product phases; not in this bot deployment.
+
+
+## October 2026 — Case-insensitive CRM and automatic game accounts
+
+Customer-facing game messages sent **by authorized staff inside a customer's Telegram support topic** are now inspected automatically. When a message contains exactly one `Username:` and one `Password:` line, the bot detects a known game suffix and saves the username/password to PostgreSQL while keeping the normal message-delivery behavior.
+
+Recognized suffixes: `3s` Orionstars, `3fk` Firekirin, `3v` Vblink, `3u` Ultrapanda, `3r` Riversweeps, `3j` Juwa, `3gv` GameVault, `3mw` Milkyway, `3cm` CashMaster. Multiple consecutive 3s are supported, such as `Player333fk`. Any player-name prefix is accepted; `Dummy` is just a sample. For custom games, add a `Game: Custom Game` line.
+
+```text
+👤 Username: Michael333fk
+🔑 Password: 009988
+Log in and let me know if you need help ❤️✨
+```
+
+Use `/accounts` inside the customer topic to see saved game accounts and passwords, `/label Special Customer` to save a custom label (spaces allowed), `/unlabel special customer` to remove it, and `/setaccount Juwa player123 009988` to add an account manually. Labels, game selection/search, account lookup, and command names match case-insensitively; passwords keep their exact case. Passwords are stored as **plaintext** by request. Keep your Railway database and staff group access restricted.
+
+**Deployment:** PostgreSQL schema migrations add an account-password column and an automatic-capture deduplication table. Always back up the database before rollout. The source-only rollback branch `backup/pre-crm-20261011` does not back up or restore PostgreSQL.
