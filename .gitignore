@@ -1,15 +1,9 @@
-# Secrets
 .env
-*.env
-!.env.example
-
-# Python
+.venv/
 __pycache__/
 *.py[cod]
-.venv/
-venv/
-
-# Editor/system
-.DS_Store
+.pytest_cache/
+*.log
+*.sqlite3
 .idea/
 .vscode/

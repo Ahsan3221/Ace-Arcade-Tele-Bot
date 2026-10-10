@@ -1,856 +1,862 @@
-import os
-import logging
+"""Ace Arcade Telegram support + lightweight CRM.
+
+Additive replacement for the original single-file bot. Existing Telegram customer
+IDs, topic IDs and old database tables remain intact.
+"""
 import asyncio
-
-from psycopg2 import pool as pg_pool
-from psycopg2.extras import RealDictCursor
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    BotCommand, BotCommandScopeChat,
-)
-from telegram.error import TelegramError
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, ContextTypes,
-    MessageHandler, filters,
-)
-
-# This template is copied into each branded project before deployment.
-BRAND = "Ace Arcade"
-USERS_TABLE = "ace_arcade_users"
-TOPICS_TABLE = "ace_arcade_topics"
-STAFF_TABLE = "ace_arcade_staff"
-
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
-SUPPORT_GROUP_ID = int(os.getenv("SUPPORT_GROUP_ID", "0") or 0)
-_staff = os.getenv("AUTHORIZED_STAFF_IDS", "")
-AUTHORIZED_STAFF = {
-    int(value.strip()) for value in _staff.split(",")
-    if value.strip().lstrip("-").isdigit()
-}
-
-GAMES = [
-    "Orionstars", "Firekirin", "Ultrapanda", "Juwa", "GameVault",
-    "Riversweeps", "Milkyway", "Vblink", "Gameroom",
-]
-TRAFFIC_SOURCES = {"website": "🌐 Website", "facebook": "📘 Facebook"}
-BONUS_OPTIONS = {
-    "signup120": "💰 120% Signup Bonus",
-    "freeplay": "🎁 Redeemable Freeplay",
-}
-
-MIN_GAP_SECONDS = 0.4
-MAX_QUEUE_SIZE = 30
-WORKER_IDLE_TIMEOUT = 5
-_pool: pg_pool.ThreadedConnectionPool | None = None
-_user_queues: dict[int, asyncio.Queue] = {}
-_user_workers: dict[int, asyncio.Task] = {}
-_background_tasks: set[asyncio.Task] = set()
-_topic_locks: dict[int, asyncio.Lock] = {}
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-# Prevent request URLs (which contain the Telegram bot token) from appearing
-# in normal Railway logs. Keep the application logger at INFO for diagnostics.
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-
-
-# ---------------------- database ----------------------
-def _pool_connection() -> pg_pool.ThreadedConnectionPool:
-    global _pool
-    database_url = os.getenv("DATABASE_URL", "").strip()
-    if not database_url:
-        raise RuntimeError("DATABASE_URL is not set.")
-    if _pool is None:
-        _pool = pg_pool.ThreadedConnectionPool(
-            minconn=1, maxconn=10, dsn=database_url,
-            cursor_factory=RealDictCursor,
-        )
-        logger.info("PostgreSQL pool created for %s", BRAND)
-    return _pool
-
-
-def _run(query_function, *args):
-    connection_pool = _pool_connection()
-    connection = connection_pool.getconn()
-    try:
-        with connection.cursor() as cursor:
-            result = query_function(cursor, *args)
-        connection.commit()
-        return result
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection_pool.putconn(connection)
-
-
-def init_db() -> None:
-    def query(cursor):
-        cursor.execute(f"""
-            CREATE TABLE IF NOT EXISTS {USERS_TABLE} (
-                user_id BIGINT PRIMARY KEY,
-                name TEXT NOT NULL DEFAULT '',
-                username TEXT NOT NULL DEFAULT '',
-                topic_id BIGINT,
-                topic_status TEXT NOT NULL DEFAULT 'open',
-                game TEXT,
-                source TEXT,
-                bonus TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
-        cursor.execute(f"""
-            CREATE TABLE IF NOT EXISTS {TOPICS_TABLE} (
-                topic_id BIGINT PRIMARY KEY,
-                user_id BIGINT NOT NULL REFERENCES {USERS_TABLE}(user_id)
-                    ON DELETE CASCADE
-            )
-        """)
-        cursor.execute(f"""
-            CREATE TABLE IF NOT EXISTS {STAFF_TABLE} (
-                user_id BIGINT PRIMARY KEY,
-                name TEXT NOT NULL DEFAULT '',
-                added_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
-        cursor.execute(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS source TEXT")
-        cursor.execute(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS bonus TEXT")
-        cursor.execute(
-            f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS "
-            "topic_status TEXT NOT NULL DEFAULT 'open'"
-        )
-    _run(query)
-
-
-def load_staff() -> None:
-    def query(cursor):
-        cursor.execute(f"SELECT user_id FROM {STAFF_TABLE}")
-        return {row["user_id"] for row in cursor.fetchall()}
-    AUTHORIZED_STAFF.update(_run(query))
-
-
-async def db_user(user_id: int):
-    def query(cursor):
-        cursor.execute(f"SELECT * FROM {USERS_TABLE} WHERE user_id = %s", (user_id,))
-        return cursor.fetchone()
-    return await asyncio.to_thread(_run, query)
-
-
-async def db_user_by_topic(topic_id: int):
-    def query(cursor):
-        cursor.execute(f"SELECT * FROM {USERS_TABLE} WHERE topic_id = %s", (topic_id,))
-        return cursor.fetchone()
-    return await asyncio.to_thread(_run, query)
-
-
-async def db_upsert(
-    user_id: int, name: str, username: str, topic_id: int | None = None,
-    game: str | None = None, status: str | None = None,
-    source: str | None = None, bonus: str | None = None,
-) -> None:
-    def query(cursor):
-        cursor.execute(f"""
-            INSERT INTO {USERS_TABLE}
-                (user_id, name, username, topic_id, game, topic_status, source, bonus)
-            VALUES (%s, %s, %s, %s, %s, COALESCE(%s, 'open'), %s, %s)
-            ON CONFLICT(user_id) DO UPDATE SET
-                name = EXCLUDED.name,
-                username = EXCLUDED.username,
-                topic_id = COALESCE(EXCLUDED.topic_id, {USERS_TABLE}.topic_id),
-                game = COALESCE(EXCLUDED.game, {USERS_TABLE}.game),
-                topic_status = COALESCE(%s, {USERS_TABLE}.topic_status),
-                source = COALESCE(EXCLUDED.source, {USERS_TABLE}.source),
-                bonus = COALESCE(EXCLUDED.bonus, {USERS_TABLE}.bonus),
-                last_seen = NOW()
-        """, (user_id, name, username, topic_id, game, status, source, bonus, status))
-    await asyncio.to_thread(_run, query)
-
-
-async def db_topic(topic_id: int, user_id: int) -> None:
-    def query(cursor):
-        cursor.execute(f"""
-            INSERT INTO {TOPICS_TABLE} (topic_id, user_id) VALUES (%s, %s)
-            ON CONFLICT(topic_id) DO UPDATE SET user_id = EXCLUDED.user_id
-        """, (topic_id, user_id))
-    await asyncio.to_thread(_run, query)
-
-
-async def db_status(user_id: int, status: str) -> None:
-    def query(cursor):
-        cursor.execute(
-            f"UPDATE {USERS_TABLE} SET topic_status = %s WHERE user_id = %s",
-            (status, user_id),
-        )
-    await asyncio.to_thread(_run, query)
-
-
-async def db_clear_topic(user_id: int, topic_id: int) -> None:
-    def query(cursor):
-        cursor.execute(
-            f"UPDATE {USERS_TABLE} SET topic_id = NULL, topic_status = 'open' "
-            "WHERE user_id = %s", (user_id,)
-        )
-        cursor.execute(f"DELETE FROM {TOPICS_TABLE} WHERE topic_id = %s", (topic_id,))
-    await asyncio.to_thread(_run, query)
-
-
-async def db_all_users():
-    def query(cursor):
-        cursor.execute(f"SELECT * FROM {USERS_TABLE}")
-        return cursor.fetchall()
-    return await asyncio.to_thread(_run, query)
-
-
-async def db_add_staff(user_id: int, name: str) -> None:
-    def query(cursor):
-        cursor.execute(f"""
-            INSERT INTO {STAFF_TABLE} (user_id, name) VALUES (%s, %s)
-            ON CONFLICT(user_id) DO UPDATE SET name = EXCLUDED.name
-        """, (user_id, name))
-    await asyncio.to_thread(_run, query)
-
-
-async def db_remove_staff(user_id: int) -> None:
-    def query(cursor):
-        cursor.execute(f"DELETE FROM {STAFF_TABLE} WHERE user_id = %s", (user_id,))
-    await asyncio.to_thread(_run, query)
-
-
-# ---------------------- shared helpers ----------------------
-def fire_and_forget(coroutine) -> None:
-    task = asyncio.create_task(coroutine)
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-
-
-def is_staff(message) -> bool:
-    return bool(message.from_user and message.from_user.id in AUTHORIZED_STAFF)
-
-
-def user_label(user) -> str:
-    name = (user.full_name or user.first_name or "Unknown Player").replace("\n", " ").strip()
-    return f"{name} (@{user.username})" if user.username else f"{name} [ID: {user.id}]"
-
-
-def parse_game(args: list[str]) -> str | None:
-    if not args:
-        return None
-    value = args[0].strip().lower()
-    return next((game for game in GAMES if game.lower() == value), None)
-
-
-def parse_source(args: list[str]) -> str | None:
-    if not args:
-        return None
-    value = args[0].strip().lower()
-    if value.startswith("src_"):
-        value = value[4:]
-    return TRAFFIC_SOURCES.get(value)
-
-
-def closed_topic(error: TelegramError) -> bool:
-    text = str(error).lower()
-    return any(item in text for item in (
-        "topic_closed", "thread_not_found", "message thread not found",
-    ))
-
-
-def game_keyboard() -> InlineKeyboardMarkup:
-    rows = []
-    for index in range(0, len(GAMES), 2):
-        row = [InlineKeyboardButton(
-            f"🎮 {GAMES[index]}", callback_data=f"game:{GAMES[index]}"
-        )]
-        if index + 1 < len(GAMES):
-            row.append(InlineKeyboardButton(
-                f"🎮 {GAMES[index + 1]}", callback_data=f"game:{GAMES[index + 1]}"
-            ))
-        rows.append(row)
-    return InlineKeyboardMarkup(rows)
-
-
-def bonus_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(BONUS_OPTIONS["signup120"], callback_data="bonus:signup120")],
-        [InlineKeyboardButton(BONUS_OPTIONS["freeplay"], callback_data="bonus:freeplay")],
-    ])
-
-
-# ---------------------- forum topics ----------------------
-def topic_lock(user_id: int) -> asyncio.Lock:
-    if user_id not in _topic_locks:
-        _topic_locks[user_id] = asyncio.Lock()
-    return _topic_locks[user_id]
-
-
-async def create_topic(user, context, game=None, source=None) -> int | None:
-    try:
-        forum_topic = await context.bot.create_forum_topic(
-            chat_id=SUPPORT_GROUP_ID, name=user_label(user)[:120]
-        )
-        topic_id = forum_topic.message_thread_id
-        old = await db_user(user.id)
-        selected_game = old["game"] if old and old["game"] else game
-        saved_source = (old.get("source") if old else None) or source
-        await db_upsert(
-            user.id, user.full_name or user.first_name or "Unknown", user.username or "",
-            topic_id=topic_id, game=selected_game, status="open", source=saved_source,
-        )
-        await db_topic(topic_id, user.id)
-        game_line = f"🎮 Game     : {selected_game}" if selected_game else "🎮 Game     : Not selected yet"
-        source_line = f"📊 Source   : {saved_source}" if saved_source else "📊 Source   : Direct/Unknown"
-        entry_line = "🔗 Entry    : Deep-link" if game or source else "🔗 Entry    : Direct"
-        await context.bot.send_message(
-            chat_id=SUPPORT_GROUP_ID, message_thread_id=topic_id,
-            text=(
-                f"👤 NEW {BRAND.upper()} PLAYER CONNECTED\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Name     : {user.full_name or user.first_name or 'Unknown'}\n"
-                f"Username : @{user.username or 'No username'}\n"
-                f"ID       : {user.id}\n{game_line}\n{source_line}\n{entry_line}\n\n"
-                "💬 Customer messages below.\n━━━━━━━━━━━━━━━━━━━━━━━━"
-            ),
-        )
-        return topic_id
-    except TelegramError as error:
-        logger.error("Topic creation failed: %s", error)
-        return None
-
-
-async def reopen_or_recreate(user, topic_id: int, context) -> int | None:
-    try:
-        await context.bot.reopen_forum_topic(
-            chat_id=SUPPORT_GROUP_ID, message_thread_id=topic_id
-        )
-        await db_status(user.id, "open")
-        await context.bot.send_message(
-            chat_id=SUPPORT_GROUP_ID, message_thread_id=topic_id,
-            text="🔓 Customer wapas aa gaya — topic reopened.",
-        )
-        return topic_id
-    except TelegramError as error:
-        logger.warning("Could not reopen topic %s: %s", topic_id, error)
-        await db_clear_topic(user.id, topic_id)
-        return await create_topic(user, context)
-
-
-async def get_topic(user, context, game=None, source=None) -> int | None:
-    lock = topic_lock(user.id)
-    try:
-        async with lock:
-            row = await db_user(user.id)
-            if row and row["topic_id"]:
-                topic_id = (
-                    await reopen_or_recreate(user, row["topic_id"], context)
-                    if row.get("topic_status") == "closed" else row["topic_id"]
-                )
-                if topic_id and (game or source):
-                    await db_upsert(
-                        user.id, user.full_name or user.first_name or "Unknown",
-                        user.username or "", game=game, source=source,
-                    )
-                return topic_id
-            return await create_topic(user, context, game, source)
-    finally:
-        if not lock.locked():
-            _topic_locks.pop(user.id, None)
-
-
-async def group_message(user, context, topic_id: int, text: str) -> int:
-    try:
-        await context.bot.send_message(
-            chat_id=SUPPORT_GROUP_ID, message_thread_id=topic_id, text=text
-        )
-        return topic_id
-    except TelegramError as error:
-        if closed_topic(error):
-            new_topic_id = await reopen_or_recreate(user, topic_id, context)
-            if new_topic_id:
-                try:
-                    await context.bot.send_message(
-                        chat_id=SUPPORT_GROUP_ID, message_thread_id=new_topic_id, text=text
-                    )
-                    return new_topic_id
-                except TelegramError as retry_error:
-                    logger.error("Message failed after topic recovery: %s", retry_error)
-        else:
-            logger.error("Group message failed: %s", error)
-    return topic_id
-
-
-async def forward_customer(user, update, context, topic_id: int, retry=False) -> bool:
-    try:
-        await context.bot.copy_message(
-            chat_id=SUPPORT_GROUP_ID, from_chat_id=user.id,
-            message_id=update.message.message_id, message_thread_id=topic_id,
-        )
-        return True
-    except TelegramError as error:
-        if closed_topic(error) and not retry:
-            new_topic_id = await reopen_or_recreate(user, topic_id, context)
-            if new_topic_id:
-                return await forward_customer(user, update, context, new_topic_id, True)
-        logger.error("Customer forward failed: %s", error)
-        return False
-
-
-# Queue cleanup contains no await between the final empty check and removal,
-# preventing an idle-boundary message from becoming stranded.
-def start_worker(user_id: int, context, queue: asyncio.Queue) -> None:
-    _user_workers[user_id] = asyncio.create_task(queue_worker(user_id, context, queue))
-
-
-async def queue_worker(user_id: int, context, queue: asyncio.Queue) -> None:
-    try:
-        while True:
-            try:
-                user, update, topic_id = await asyncio.wait_for(
-                    queue.get(), timeout=WORKER_IDLE_TIMEOUT
-                )
-            except asyncio.TimeoutError:
-                if queue.empty():
-                    return
-                continue
-            if not await forward_customer(user, update, context, topic_id):
-                try:
-                    await update.message.reply_text("⚠️ Could not send your message. Please try again.")
-                except TelegramError:
-                    pass
-            await asyncio.sleep(MIN_GAP_SECONDS)
-    finally:
-        if _user_workers.get(user_id) is asyncio.current_task():
-            _user_workers.pop(user_id, None)
-        if _user_queues.get(user_id) is queue:
-            if queue.empty():
-                _user_queues.pop(user_id, None)
-            elif user_id not in _user_workers:
-                start_worker(user_id, context, queue)
-
-
-async def enqueue(user, update, context, topic_id: int) -> None:
-    queue = _user_queues.setdefault(user.id, asyncio.Queue(maxsize=MAX_QUEUE_SIZE))
-    try:
-        queue.put_nowait((user, update, topic_id))
-    except asyncio.QueueFull:
-        await update.message.reply_text(
-            "⚠️ Bohot zyada messages ek sath aa rahe hain. Thoda ruk ke bhejein."
-        )
-        return
-    worker = _user_workers.get(user.id)
-    if worker is None or worker.done():
-        start_worker(user.id, context, queue)
-
-
-# ---------------------- customer actions ----------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user:
-        return
-    user = update.effective_user
-    game, source = parse_game(context.args or []), parse_source(context.args or [])
-    if game:
-        await update.message.reply_text(
-            f"👋 Welcome to {BRAND} Support!\n\n🎮 Game selected: {game}\n\n"
-            "💬 Send your message — our team will assist you right away!"
-        )
-    else:
-        await update.message.reply_text(
-            f"👋 Welcome to {BRAND} Support!\n\n🎁 Choose your bonus:",
-            reply_markup=bonus_keyboard(),
-        )
-    fire_and_forget(finalize_start(user, context, game, source))
-
-
-async def finalize_start(user, context, game, source) -> None:
-    try:
-        old = await db_user(user.id)
-        new_user = not (old and old.get("topic_id"))
-        topic_id = await get_topic(user, context, game, source)
-        if topic_id and not new_user:
-            details = [
-                f"👤 Name     : {user.full_name or user.first_name or 'Unknown'}",
-                f"🔗 Username : @{user.username or 'No username'}", f"🆔 ID       : {user.id}",
-            ]
-            if game:
-                details.append(f"🎮 Game     : {game}")
-            if source:
-                details.append(f"📊 Source   : {source}")
-            await group_message(
-                user, context, topic_id,
-                "🔁 CUSTOMER STARTED BOT AGAIN\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                + "\n".join(details) + "\n━━━━━━━━━━━━━━━━━━━━━━━━",
-            )
-    except Exception:
-        logger.exception("/start finalization failed for %s", user.id)
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        await update.message.reply_text(
-            f"ℹ️ {BRAND.upper()} SUPPORT — HELP\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "/start       — Begin or restart your support chat\n"
-            "/games       — Choose or change your game\n"
-            "/support — Reach our support team\n"
-            "/help    — Show this message\n\n"
-            "💬 You can also send a message anytime — our team will reply here."
-        )
-
-
-async def bonus_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query:
-        return
-    await query.answer()
-    bonus = BONUS_OPTIONS.get(query.data.replace("bonus:", "", 1))
-    if not bonus:
-        await query.message.reply_text("⚠️ Invalid bonus selection.")
-        return
-    await query.message.reply_text(
-        f"✅ {bonus} selected!\n\n🎮 Now choose your game:", reply_markup=game_keyboard()
-    )
-    fire_and_forget(finalize_bonus(query.from_user, context, bonus))
-
-
-async def finalize_bonus(user, context, bonus: str) -> None:
-    try:
-        topic_id = await get_topic(user, context)
-        if topic_id:
-            await db_upsert(
-                user.id, user.full_name or user.first_name or "Unknown", user.username or "",
-                topic_id=topic_id, bonus=bonus,
-            )
-            await group_message(user, context, topic_id, f"🎁 BONUS SELECTED: {bonus}")
-    except Exception:
-        logger.exception("Bonus finalization failed for %s", user.id)
-
-
-async def games(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message and update.effective_user:
-        await update.message.reply_text("🎮 Choose your game:", reply_markup=game_keyboard())
-        fire_and_forget(command_touch(update.effective_user, context, "games"))
-
-
-async def support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message and update.effective_user:
-        await update.message.reply_text("💬 Select your game (optional):", reply_markup=game_keyboard())
-        fire_and_forget(command_touch(update.effective_user, context, "support"))
-
-
-async def command_touch(user, context, command: str) -> None:
-    try:
-        old = await db_user(user.id)
-        new_user = not (old and old.get("topic_id"))
-        topic_id = await get_topic(user, context)
-        if topic_id and not new_user:
-            await group_message(
-                user, context, topic_id,
-                f"🔁 CUSTOMER USED /{command}\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"👤 Name     : {user.full_name or user.first_name or 'Unknown'}\n"
-                f"🔗 Username : @{user.username or 'No username'}\n🆔 ID       : {user.id}\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━",
-            )
-    except Exception:
-        logger.exception("/%s finalization failed for %s", command, user.id)
-
-
-async def game_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query:
-        return
-    await query.answer()
-    game = query.data.replace("game:", "", 1)
-    if game not in GAMES:
-        await query.message.reply_text("⚠️ Invalid game selection.")
-        return
-    await query.message.reply_text(
-        f"✅ {game} selected!\n\n💬 Send your message — team will reply shortly!"
-    )
-    fire_and_forget(finalize_game(query.from_user, context, game))
-
-
-async def finalize_game(user, context, game: str) -> None:
-    try:
-        topic_id = await get_topic(user, context)
-        if topic_id:
-            await db_upsert(
-                user.id, user.full_name or user.first_name or "Unknown", user.username or "",
-                topic_id=topic_id, game=game,
-            )
-            await db_topic(topic_id, user.id)
-            await group_message(user, context, topic_id, f"🎮 GAME SELECTED: {game}")
-    except Exception:
-        logger.exception("Game finalization failed for %s", user.id)
-
-
-async def customer_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user:
-        return
-    user = update.effective_user
-    try:
-        topic_id = await get_topic(user, context)
-    except Exception:
-        logger.exception("Could not prepare support topic for customer %s", user.id)
-        topic_id = None
-    if not topic_id:
-        await update.message.reply_text("⚠️ Support system temporarily unavailable. Please try again.")
-        return
-    await enqueue(user, update, context, topic_id)
-
-
-# ---------------------- support group / staff ----------------------
-async def support_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    message = update.message
-    if message.chat.id != SUPPORT_GROUP_ID or (message.from_user and message.from_user.is_bot):
-        return
-    # Security: group members who are not staff cannot send messages to a customer.
-    if not is_staff(message):
-        logger.warning("Ignoring non-staff support-group message from %s", message.from_user)
-        return
-    topic_id = message.message_thread_id
-    if not topic_id or topic_id == 1:
-        return
-    row = await db_user_by_topic(topic_id)
-    if not row:
-        return
-    try:
-        await context.bot.copy_message(
-            chat_id=int(row["user_id"]), from_chat_id=SUPPORT_GROUP_ID,
-            message_id=message.message_id,
-        )
-    except TelegramError as error:
-        logger.error("Staff reply delivery failed: %s", error)
-        error_text = str(error).lower()
-        if any(value in error_text for value in ("blocked", "deactivated", "chat not found", "forbidden")):
-            warning = "⚠️ DELIVERY FAILED\n\nCustomer ne bot block kar diya hai ya account deactivate hai."
-        else:
-            warning = f"⚠️ Reply delivery error: {error}"
+import logging
+import re
+from decimal import Decimal, InvalidOperation
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+
+from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import TelegramError, RetryAfter
+from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
+                          ContextTypes, MessageHandler, filters)
+from psycopg2 import IntegrityError
+from settings import BRAND, Config, GAMES, BONUS_OPTIONS, LABELS
+from crm import (parse_game, parse_source, normalize_game, normalize_label,
+                 normalize_workflow, safe_username, topic_title, profile_text,
+                 retry_delay, is_permanent_error, is_topic_missing, short)
+from database import Database
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
+log = logging.getLogger(__name__)
+
+
+class State:
+    def __init__(self, cfg, db):
+        self.cfg, self.db = cfg, db
+        self.roles = {}
+        self.tasks = []
+        self._user_locks = {}
+        self._lock_guard = asyncio.Lock()
+        self.delivery_wakeup = asyncio.Event()
+
+    @asynccontextmanager
+    async def lock(self, user_id):
+        # Ref counting prevents the original cleanup race: no waiting task can
+        # hold a lock object which has been removed from the dictionary.
+        async with self._lock_guard:
+            entry = self._user_locks.get(user_id)
+            if entry is None:
+                entry = [asyncio.Lock(), 0]
+                self._user_locks[user_id] = entry
+            entry[1] += 1
         try:
-            await context.bot.send_message(
-                chat_id=SUPPORT_GROUP_ID, message_thread_id=topic_id, text=warning
-            )
-        except TelegramError:
-            pass
+            async with entry[0]:
+                yield
+        finally:
+            async with self._lock_guard:
+                entry[1] -= 1
+                if entry[1] == 0 and self._user_locks.get(user_id) is entry:
+                    self._user_locks.pop(user_id, None)
 
 
-async def require_staff(update: Update) -> bool:
-    if not update.message or update.message.chat.id != SUPPORT_GROUP_ID:
+def state(context):
+    return context.application.bot_data['state']
+
+
+def in_group(update, s):
+    return bool(update.effective_chat and update.effective_chat.id == s.cfg.group_id)
+
+
+def in_private(update):
+    return bool(update.effective_chat and update.effective_chat.type == 'private')
+
+
+def owner(update, s):
+    return bool(update.effective_user and update.effective_user.id in s.cfg.owner_ids)
+
+
+def staff_role(update, s):
+    uid = update.effective_user.id if update.effective_user else None
+    if uid in s.cfg.owner_ids:
+        return 'owner'
+    return s.roles.get(uid)
+
+
+async def authorize(update, context, owner_only=False):
+    s = state(context)
+    message = update.effective_message
+    if not message or not in_group(update, s):
         return False
-    if not is_staff(update.message):
-        await update.message.reply_text("⛔ You are not authorized to use this command.")
+    role = staff_role(update, s)
+    if role not in (('owner',) if owner_only else ('owner','admin','staff')):
+        await message.reply_text('⛔ Only authorized ' + ('owners' if owner_only else 'staff') + ' can use this command.')
         return False
     return True
 
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_staff(update):
-        return
-    def query(cursor):
-        cursor.execute(f"SELECT COUNT(*) AS c FROM {USERS_TABLE}")
-        total = cursor.fetchone()["c"]
-        cursor.execute(f"SELECT COUNT(*) AS c FROM {USERS_TABLE} WHERE created_at >= NOW() - INTERVAL '1 day'")
-        today = cursor.fetchone()["c"]
-        cursor.execute(f"SELECT COUNT(*) AS c FROM {USERS_TABLE} WHERE topic_id IS NOT NULL AND topic_status = 'open'")
-        active = cursor.fetchone()["c"]
-        result = []
-        for column in ("game", "source", "bonus"):
-            cursor.execute(f"SELECT {column}, COUNT(*) AS c FROM {USERS_TABLE} WHERE {column} IS NOT NULL GROUP BY {column} ORDER BY c DESC")
-            result.append(cursor.fetchall())
-        return total, today, active, *result
-    total, today, active, games_data, sources_data, bonuses_data = await asyncio.to_thread(_run, query)
-    def rows(data, column):
-        return "\n".join(f"  {row[column]}: {row['c']} players" for row in data) or "  No data yet."
-    await update.message.reply_text(
-        f"📊 {BRAND.upper()} STATISTICS\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👥 Total Customers : {total}\n🆕 New Today       : {today}\n💬 Open Topics     : {active}\n\n"
-        f"🎮 GAME BREAKDOWN\n━━━━━━━━━━━━━━━━━━━━━━━━\n{rows(games_data, 'game')}\n\n"
-        f"📊 SOURCE BREAKDOWN\n━━━━━━━━━━━━━━━━━━━━━━━━\n{rows(sources_data, 'source')}\n\n"
-        f"🎁 BONUS BREAKDOWN\n━━━━━━━━━━━━━━━━━━━━━━━━\n{rows(bonuses_data, 'bonus')}\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━"
-    )
+async def topic_customer(update, context, owner_only=False):
+    if not await authorize(update,context,owner_only):
+        return None
+    mid = update.effective_message.message_thread_id
+    if not mid or mid == 1:
+        await update.effective_message.reply_text('⚠️ Use this command inside a customer forum topic.')
+        return None
+    row = await state(context).db.by_topic(mid)
+    if not row:
+        await update.effective_message.reply_text('⚠️ No customer mapped to this topic.')
+    return row
 
 
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_staff(update):
+def game_keyboard():
+    keys = []
+    for i in range(0, len(GAMES), 2):
+        keys.append([InlineKeyboardButton(f'🎮 {x}', callback_data=f'game:{x}')
+                     for x in GAMES[i:i+2]])
+    return InlineKeyboardMarkup(keys)
+
+
+def bonus_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(v, callback_data=f'bonus:{k}')]
+        for k, v in BONUS_OPTIONS.items()
+    ])
+
+
+async def _update_profile_locked(s, bot, uid):
+    row = await s.db.user(uid)
+    if not row or not row['topic_id']:
         return
-    text = " ".join(context.args or []).strip()
-    if not text:
-        await update.message.reply_text("⚠️ Usage: /broadcast <message>\nExample: /broadcast Hi {name}, naya game added!")
-        return
-    users = await db_all_users()
-    if not users:
-        await update.message.reply_text("❌ No customers in database yet.")
-        return
-    progress = await update.message.reply_text(f"📡 Broadcasting to {len(users)} customers...")
-    delivered = failed = 0
-    for row in users:
-        try:
-            name = (row["name"] or "there").split(" ")[0]
-            await context.bot.send_message(
-                chat_id=row["user_id"], text=f"📢 {BRAND} UPDATE\n\n{text.replace('{name}', name)}"
-            )
-            delivered += 1
-            await asyncio.sleep(0.05)
-        except TelegramError:
-            failed += 1
+    topic = int(row['topic_id'])
+    parts = await s.db.profile_parts(uid)
+    body = profile_text(row,*parts)
     try:
-        await progress.edit_text(
-            "📡 BROADCAST COMPLETE\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"✅ Delivered : {delivered}\n❌ Failed    : {failed}\n📨 Total     : {len(users)}\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━"
-        )
+        await bot.edit_forum_topic(s.cfg.group_id,topic,name=topic_title(row))
+    except TelegramError as exc:
+        if 'not modified' not in str(exc).lower():
+            log.warning('Topic title update failed user=%s: %s',uid,exc)
+    pid = row['profile_message_id']
+    if pid:
+        try:
+            await bot.edit_message_text(body, chat_id=s.cfg.group_id,message_id=int(pid))
+            return
+        except TelegramError as exc:
+            if 'not modified' in str(exc).lower():
+                return
+            log.warning('Profile edit failed user=%s: %s',uid,exc)
+    # On fresh topic or deleted original profile, create a new pin.
+    try:
+        msg = await bot.send_message(chat_id=s.cfg.group_id,message_thread_id=topic,text=body)
+        await s.db.profile_id(uid,msg.message_id)
+        try:
+            await bot.pin_chat_message(chat_id=s.cfg.group_id,message_id=msg.message_id,disable_notification=True)
+        except TelegramError as exc:
+            log.warning('Profile pin failed user=%s (bot needs pin permission): %s',uid,exc)
+    except TelegramError as exc:
+        log.warning('Profile creation failed user=%s: %s',uid,exc)
+
+
+async def refresh_profile(s, bot, uid):
+    async with s.lock(uid):
+        await _update_profile_locked(s,bot,uid)
+
+
+async def _create_topic_locked(user,s,bot):
+    row = await s.db.user(user.id)
+    topic = await bot.create_forum_topic(chat_id=s.cfg.group_id,name=topic_title(row))
+    topic_id = int(topic.message_thread_id)
+    try:
+        await s.db.assign_topic(user.id, topic_id)
+    except Exception:
+        try:
+            await bot.delete_forum_topic(chat_id=s.cfg.group_id,message_thread_id=topic_id)
+        except TelegramError:
+            log.exception('Orphan topic cleanup failed: %s',topic_id)
+        raise
+    await _update_profile_locked(s,bot,user.id)
+    log.info('Created topic user=%s topic=%s',user.id,topic_id)
+    return topic_id
+
+
+async def _recover_topic_locked(user,s,bot,row):
+    tid = int(row['topic_id'])
+    try:
+        await bot.reopen_forum_topic(chat_id=s.cfg.group_id,message_thread_id=tid)
+    except TelegramError as exc:
+        msg=str(exc).lower()
+        if 'not modified' in msg or 'not closed' in msg:
+            pass
+        elif is_topic_missing(exc) and 'closed' not in msg:
+            log.warning('Topic not found, recreating user=%s topic=%s',user.id,tid)
+            return await _create_topic_locked(user,s,bot)
+        else:
+            # Rate limits / permissions / API outages MUST NOT orphan topics.
+            log.warning('Topic reopen deferred user=%s topic=%s: %s',user.id,tid,exc)
+            raise
+    await s.db.mark_topic(user.id,'open')
+    return tid
+
+
+async def get_topic(user,context,game=None,source=None,bonus=None):
+    s=state(context)
+    async with s.lock(user.id):
+        row=await s.db.upsert_user(user,game=game,source=source,bonus=bonus)
+        if row['topic_id']:
+            if row['topic_status']=='closed':
+                result=await _recover_topic_locked(user,s,context.bot,row)
+            else:
+                result=int(row['topic_id'])
+            if game or source or bonus or not row['profile_message_id']:
+                await _update_profile_locked(s,context.bot,user.id)
+            return result
+        return await _create_topic_locked(user,s,context.bot)
+
+
+async def recover_after_delivery(s,bot,uid):
+    row = await s.db.user(uid)
+    if not row:
+        return None
+    if not row['topic_id']:
+        return None
+    async with s.lock(uid):
+        row = await s.db.user(uid)
+        tid = int(row['topic_id'])
+        try:
+            await bot.reopen_forum_topic(chat_id=s.cfg.group_id,message_thread_id=tid)
+            await s.db.mark_topic(uid,'open')
+            return tid
+        except TelegramError as exc:
+            msg=str(exc).lower()
+            if 'not closed' in msg:
+                await s.db.mark_topic(uid,'open')
+                return tid
+            if is_topic_missing(exc) and 'closed' not in msg:
+                # Regenerate a missing forum topic using the stored user identity.
+                saved_user=SimpleNamespace(id=uid,full_name=row['name'],first_name=row['name'],
+                                           username=row['username'])
+                return await _create_topic_locked(saved_user,s,bot)
+            log.warning('Delivery topic recovery deferred user=%s topic=%s: %s',uid,tid,exc)
+            raise
+
+
+async def deliver_job(application, s, job):
+    bot=application.bot
+    uid=int(job['user_id'])
+    row=await s.db.user(uid)
+    if not row:
+        return True
+    direction=job['direction']
+    if direction=='broadcast' and not row['marketing_opt_in']:
+        return True  # honor a subsequent /optout even if previously queued
+    if direction=='customer':
+        tid=row['topic_id']
+        if not tid:
+            raise RuntimeError('Customer topic has not been mapped')
+        try:
+            await bot.copy_message(chat_id=s.cfg.group_id,message_thread_id=int(tid),
+                                   from_chat_id=int(job['source_chat_id']),
+                                   message_id=int(job['source_message_id']))
+        except TelegramError as exc:
+            if is_topic_missing(exc):
+                tid=await recover_after_delivery(s,bot,uid)
+                if tid:
+                    await bot.copy_message(chat_id=s.cfg.group_id,message_thread_id=tid,
+                                           from_chat_id=int(job['source_chat_id']),
+                                           message_id=int(job['source_message_id']))
+                else:
+                    raise
+            else:
+                raise
+    elif direction=='staff':
+        await bot.copy_message(chat_id=uid,from_chat_id=int(job['source_chat_id']),
+                               message_id=int(job['source_message_id']))
+    else:
+        await bot.send_message(chat_id=uid,text=job['body'])
+    return True
+
+
+async def outbox_worker(application,s):
+    log.info('Persistent outbox worker started')
+    while True:
+        try:
+            job=await s.db.outbox_claim()
+            if job is None:
+                try:
+                    await asyncio.wait_for(s.delivery_wakeup.wait(),timeout=1)
+                except asyncio.TimeoutError:
+                    pass
+                s.delivery_wakeup.clear()
+                continue
+            attempt=int(job['attempts'])+1
+            try:
+                await deliver_job(application,s,job)
+            except RetryAfter as exc:
+                delay=max(1,int(exc.retry_after)+1)
+                await s.db.outbox_result(job['id'],False,str(exc),delay)
+                log.warning('Delivery rate limited job=%s retry=%ss',job['id'],delay)
+            except Exception as exc:
+                permanent=is_permanent_error(exc)
+                retry=0 if permanent or attempt>=s.cfg.max_delivery_attempts else retry_delay(attempt)
+                await s.db.outbox_result(job['id'],False,str(exc),retry)
+                log.warning('Delivery failed job=%s direction=%s attempt=%s retry=%s: %s',
+                            job['id'],job['direction'],attempt,retry,exc)
+                if not retry and job['direction']=='customer':
+                    try:
+                        await application.bot.send_message(chat_id=int(job['user_id']),
+                            text='⚠️ Your earlier message could not reach support. Please send it again.')
+                    except TelegramError:
+                        pass
+                if not retry and job['direction'] in ('staff','shortcut'):
+                    try:
+                        row=await s.db.user(job['user_id'])
+                        if row and row['topic_id']:
+                            await application.bot.send_message(chat_id=s.cfg.group_id,
+                               message_thread_id=row['topic_id'],
+                               text=f'⚠️ Delivery failed for message/job {job["id"]}: {short(exc,150)}')
+                    except TelegramError:
+                        pass
+            else:
+                await s.db.outbox_result(job['id'],True)
+            await asyncio.sleep(s.cfg.broadcast_gap if job['direction']=='broadcast' else 0.4)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception('Outbox worker crashed during iteration; recovering')
+            await asyncio.sleep(2)
+
+
+async def retention_worker(application,s):
+    if not s.cfg.retention_days:
+        return
+    while True:
+        try:
+            for row in await s.db.old_customers(s.cfg.retention_days):
+                try:
+                    if row['topic_id']:
+                        await application.bot.delete_forum_topic(chat_id=s.cfg.group_id,message_thread_id=int(row['topic_id']))
+                    await s.db.delete_user(row['user_id'])
+                except TelegramError:
+                    # Fail closed: don't delete DB customer metadata while forum copies remain.
+                    log.exception('Retention topic deletion failed user=%s',row['user_id'])
+                except Exception:
+                    log.exception('Retention DB cleanup failed user=%s',row['user_id'])
+            await asyncio.sleep(24*3600)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception('Retention cycle error')
+            await asyncio.sleep(3600)
+
+
+async def enqueue_incoming(s,uid,direction,message):
+    jid=await s.db.outbox_enqueue(uid,direction,message.chat.id,message.message_id)
+    if jid:
+        s.delivery_wakeup.set()
+    return jid
+
+
+async def customer_start(update,context):
+    if not in_private(update):
+        return
+    user=update.effective_user
+    game=parse_game(context.args or [])
+    source=parse_source(context.args or [])
+    try:
+        await get_topic(user,context,game=game,source=source)
+    except Exception:
+        log.exception('Customer start failed user=%s',user.id)
+        await update.message.reply_text('⚠️ Support is temporarily unavailable. Please try again shortly.')
+        return
+    if game:
+        await update.message.reply_text(f'👋 Welcome to {BRAND} Support!\n🎮 Game selected: {game}\nSend your message below.')
+    else:
+        await update.message.reply_text(f'👋 Welcome to {BRAND} Support!\n🎁 Choose your bonus:',reply_markup=bonus_keyboard())
+
+
+async def help_command(update,context):
+    if not in_private(update):
+        return
+    await update.message.reply_text(
+        f'{BRAND} SUPPORT\n/start — Begin support\n/games — Choose a game\n'
+        '/support — Contact staff\n/privacy — Privacy policy\n/delete_data — Request account deletion\n'
+        '/optin — Subscribe to optional updates\n/optout — Stop optional updates\n'
+        'Or simply send a message here.')
+
+
+async def game_list(update,context):
+    if not in_private(update):
+        return
+    await get_topic(update.effective_user,context)
+    await update.message.reply_text('🎮 Choose your game:',reply_markup=game_keyboard())
+
+
+async def support(update,context):
+    if not in_private(update):
+        return
+    await get_topic(update.effective_user,context)
+    await update.message.reply_text('💬 Send your message here. You can also choose a game:',reply_markup=game_keyboard())
+
+
+async def customer_choice(update,context):
+    query=update.callback_query
+    if not query or not in_private(update):
+        return
+    await query.answer()
+    u=update.effective_user
+    if query.data.startswith('bonus:'):
+        bonus=BONUS_OPTIONS.get(query.data[6:])
+        if not bonus:
+            await query.message.reply_text('Invalid bonus selection.')
+            return
+        await get_topic(u,context,bonus=bonus)
+        await query.message.reply_text(f'✅ {bonus} selected. Choose a game:',reply_markup=game_keyboard())
+    elif query.data.startswith('game:'):
+        game=parse_game([query.data[5:]])
+        if not game:
+            await query.message.reply_text('Invalid game selection.')
+            return
+        await get_topic(u,context,game=game)
+        await query.message.reply_text(f'✅ {game} selected. Send your message here.')
+
+
+async def customer_message(update,context):
+    if not in_private(update) or not update.message:
+        return
+    user=update.effective_user
+    try:
+        await get_topic(user,context)
+        if await enqueue_incoming(state(context),user.id,'customer',update.message) is None:
+            log.info('Duplicate customer update ignored user=%s msg=%s',user.id,update.message.message_id)
+    except Exception:
+        log.exception('Customer message processing failed user=%s',user.id)
+        await update.message.reply_text('⚠️ Message could not be saved. Please try again.')
+
+
+async def group_message(update,context):
+    s=state(context)
+    msg=update.message
+    if not msg or not in_group(update,s) or not msg.from_user or msg.from_user.is_bot:
+        return
+    if not staff_role(update,s):
+        log.warning('Ignored unauthorized group message from id=%s',msg.from_user.id)
+        return
+    tid=msg.message_thread_id
+    if not tid or tid==1:
+        return
+    row=await s.db.by_topic(tid)
+    if not row:
+        return
+    try:
+        await enqueue_incoming(s,int(row['user_id']),'staff',msg)
+    except Exception:
+        log.exception('Could not queue staff message id=%s',msg.message_id)
+        await msg.reply_text('⚠️ Message NOT queued; please retry.')
+
+
+async def show_profile(update,context):
+    row=await topic_customer(update,context)
+    if not row:
+        return
+    s=state(context)
+    parts=await s.db.profile_parts(row['user_id'])
+    await update.message.reply_text(profile_text(row,*parts))
+
+
+async def edit_profile(update,context,action):
+    row=await topic_customer(update,context,owner_only=(action=='deposit'))
+    if not row:
+        return
+    s=state(context)
+    args=context.args or []
+    uid=int(row['user_id'])
+    actor=update.effective_user.id
+    try:
+        if action=='setaccount':
+            if len(args)!=2:
+                raise ValueError('Usage: /setaccount <Game> <username>')
+            game=normalize_game(args[0]); account=safe_username(args[1])
+            duplicates=await s.db.set_account(uid,game,account,actor)
+            message=f'✅ Saved {game} account: {account}'
+            if duplicates:
+                message+=f'\n⚠️ Same game account is linked to customer IDs: {", ".join(map(str,duplicates))}'
+        elif action=='delaccount':
+            if len(args)!=1:
+                raise ValueError('Usage: /delaccount <Game>')
+            game=normalize_game(args[0])
+            if not await s.db.delete_account(uid,game,actor):
+                await update.message.reply_text('Account was not found.')
+                return
+            message=f'✅ Removed saved {game} account.'
+        elif action in ('label','unlabel'):
+            if len(args)!=1:
+                raise ValueError(f'Usage: /{action} <VIP|Depositor|Regular|Freeplay|New>')
+            label=normalize_label(args[0])
+            await s.db.set_label(uid,label,actor,remove=(action=='unlabel'))
+            message=f'✅ Label {label} {"removed" if action=="unlabel" else "saved"}.'
+        elif action=='note':
+            body=' '.join(args).strip()
+            if not body or len(body)>500:
+                raise ValueError('Usage: /note <text> (maximum 500 characters)')
+            await s.db.note(uid,body,actor)
+            message='✅ Staff note saved (visible only to authorized staff).'
+        elif action=='status':
+            if len(args)!=1:
+                raise ValueError('Usage: /status <new|pending|in_progress|resolved>')
+            value=normalize_workflow(args[0]); await s.db.workflow(uid,value,actor)
+            message=f'✅ Workflow status updated: {value}'
+        elif action=='assign':
+            if len(args)!=1 or (args[0].lower()!='none' and not args[0].isdigit()):
+                raise ValueError('Usage: /assign <authorized_staff_id|none>')
+            staff_id=None if args[0].lower()=='none' else int(args[0])
+            if staff_id and staff_id not in s.roles and staff_id not in s.cfg.owner_ids:
+                raise ValueError('That ID is not an active authorized staff member.')
+            await s.db.assign(uid,staff_id,actor)
+            message=f'✅ Assigned to {staff_id or "nobody"}.'
+        elif action=='deposit':
+            if len(args)!=2:
+                raise ValueError('Usage: /deposit <amount> <unique_reference> (owner only)')
+            amount=Decimal(args[0]); ref=short(args[1],100)
+            if not amount.is_finite() or amount<=0 or amount>100000000 or len(ref)<3:
+                raise ValueError('Enter positive amount and a reference (at least 3 characters).')
+            await s.db.deposit(uid,amount,ref,actor)
+            message=f'✅ Staff-entered payment record saved: ${amount:.2f}, ref {ref}.\n💰 Depositor label added automatically. This is not automatic payment verification.'
+        else:
+            raise ValueError('Unknown edit command')
+    except (ValueError, InvalidOperation) as exc:
+        await update.message.reply_text(f'⚠️ {exc}')
+        return
+    except IntegrityError:
+        await update.message.reply_text('⚠️ Database rejected this value (possibly duplicate payment reference).')
+        return
+    await refresh_profile(s,context.bot,uid)
+    await update.message.reply_text(message)
+
+
+async def cmd_setaccount(u,c): await edit_profile(u,c,'setaccount')
+async def cmd_delaccount(u,c): await edit_profile(u,c,'delaccount')
+async def cmd_label(u,c): await edit_profile(u,c,'label')
+async def cmd_unlabel(u,c): await edit_profile(u,c,'unlabel')
+async def cmd_note(u,c): await edit_profile(u,c,'note')
+async def cmd_status(u,c): await edit_profile(u,c,'status')
+async def cmd_assign(u,c): await edit_profile(u,c,'assign')
+async def cmd_deposit(u,c): await edit_profile(u,c,'deposit')
+
+
+async def find_account(update,context):
+    if not await authorize(update,context): return
+    if len(context.args or [])!=1:
+        await update.message.reply_text('Usage: /findaccount <game_username>')
+        return
+    term=context.args[0]
+    matches=await state(context).db.find_account(term)
+    if not matches:
+        await update.message.reply_text('No saved account matches.')
+        return
+    lines=[f'🔎 {short(term,80)} — saved account matches:']
+    for r in matches:
+        lines.append(f'{r["game"]}: {r["account_username"]} | {short(r["name"],50)} (ID {r["user_id"]}, topic {r["topic_id"]})')
+    await update.message.reply_text('\n'.join(lines)[:3950])
+
+
+async def show_history(update,context):
+    row=await topic_customer(update,context)
+    if not row: return
+    records=await state(context).db.history(row['user_id'])
+    content='\n'.join(f'{x["created_at"]:%Y-%m-%d %H:%M} | {x["action"]} | staff {x["actor_id"]}: {short(x["detail"],80)}' for x in records)
+    await update.message.reply_text('📜 CUSTOMER CHANGES\n'+(content or 'No changes recorded yet.'))
+
+
+async def close_topic(update,context):
+    row=await topic_customer(update,context)
+    if not row: return
+    s=state(context); uid=int(row['user_id']); tid=int(row['topic_id'])
+    async with s.lock(uid):
+        await update.message.reply_text('✅ Closing topic. New customer messages will reopen it.')
+        try:
+            await context.bot.close_forum_topic(chat_id=s.cfg.group_id,message_thread_id=tid)
+        except TelegramError as exc:
+            await update.message.reply_text(f'⚠️ Could not close Telegram topic: {short(exc)}')
+            return
+        await s.db.mark_topic(uid,'closed')
+    try:
+        await context.bot.send_message(chat_id=uid,text=f'✅ Your {BRAND} support chat has been closed. Send a message anytime to reopen it.')
     except TelegramError:
         pass
 
 
-async def customer_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_staff(update):
+async def stats(update,context):
+    if not await authorize(update,context): return
+    main,games,labels=await state(context).db.stats()
+    lines=[f'📊 {BRAND} Statistics',f'Total: {main["total"]} | New today: {main["today"]} | Open topics: {main["open"]}',
+           '\nGames:']+[f'{x["game"]}: {x["c"]}' for x in games]+['\nPrimary labels:']+[f'{x["primary_label"]}: {x["c"]}' for x in labels]
+    await update.message.reply_text('\n'.join(lines))
+
+
+async def health(update,context):
+    if not await authorize(update,context,owner_only=True): return
+    counts=await state(context).db.outbox_counts()
+    await update.message.reply_text('🩺 Delivery queue\n'+'\n'.join(f'{k}: {v}' for k,v in counts.items()))
+
+
+async def staff_list(update,context):
+    if not await authorize(update,context): return
+    s=state(context)
+    await update.message.reply_text('👥 Active staff\n'+'\n'.join(f'{uid}: {role}' for uid,role in sorted(s.roles.items())))
+
+
+async def staff_modify(update,context,remove=False):
+    if not await authorize(update,context,owner_only=True): return
+    args=context.args or []
+    if not args or not args[0].isdigit() or int(args[0])<=0:
+        await update.message.reply_text('Usage: /addstaff <telegram_id> [name] or /removestaff <telegram_id>')
         return
-    topic_id = update.message.message_thread_id
-    if not topic_id or topic_id == 1:
-        await update.message.reply_text("⚠️ Use /id inside a customer topic.")
+    uid=int(args[0]); s=state(context)
+    if uid in s.cfg.owner_ids:
+        await update.message.reply_text('Owner access is controlled by OWNER_IDS and cannot be changed here.')
         return
-    row = await db_user_by_topic(topic_id)
-    if not row:
-        await update.message.reply_text("❌ No customer connected to this topic.")
+    name=' '.join(args[1:])[:100] or 'Staff'
+    await s.db.staff_set(uid,name,'staff',not remove)
+    s.roles=await s.db.roles()
+    await update.message.reply_text(f'✅ ID {uid} {"deactivated" if remove else "activated"}. Change persists across restarts.')
+
+
+async def addstaff(update,context): await staff_modify(update,context,False)
+async def removestaff(update,context): await staff_modify(update,context,True)
+
+
+async def shortcut_list(update,context):
+    if not await authorize(update,context): return
+    data=await state(context).db.shortcuts()
+    await update.message.reply_text('⚡ Shortcuts\n'+('\n'.join(f'/use {x["shortcut_key"]}: {short(x["body"],100)}' for x in data) or 'No shortcuts.'))
+
+
+async def shortcut_change(update,context,remove=False):
+    if not await authorize(update,context,owner_only=True): return
+    args=context.args or []
+    if not args or not re.fullmatch('[a-z0-9_]{1,25}',args[0].lower()):
+        await update.message.reply_text('Usage: /addshortcut <key> <message> or /delshortcut <key>')
         return
+    s=state(context); key=args[0].lower()
+    if remove:
+        found=await s.db.shortcut_delete(key)
+        await update.message.reply_text('✅ Deleted.' if found else 'Not found.')
+        return
+    body=' '.join(args[1:]).strip()
+    if not body or len(body)>3000:
+        await update.message.reply_text('Shortcuts must contain 1-3000 characters.')
+        return
+    await s.db.shortcut_set(key,body,update.effective_user.id)
+    await update.message.reply_text('✅ Saved shortcut '+key)
+
+
+async def addshortcut(update,context): await shortcut_change(update,context,False)
+async def delshortcut(update,context): await shortcut_change(update,context,True)
+
+
+async def use_shortcut(update,context):
+    row=await topic_customer(update,context)
+    if not row: return
+    args=context.args or []
+    if len(args)!=1:
+        await update.message.reply_text('Usage: /use <shortcut_key>')
+        return
+    s=state(context)
+    text=await s.db.shortcut_get(args[0].lower())
+    if not text:
+        await update.message.reply_text('Shortcut not found. Try /shortcuts.')
+        return
+    text=text.replace('{name}',(row['name'] or 'there').split(' ')[0])
+    key=f'shortcut:{s.cfg.group_id}:{update.message.message_id}'
+    await s.db.outbox_enqueue(row['user_id'],'shortcut',body=text,key=key)
+    s.delivery_wakeup.set()
+    await update.message.reply_text('✅ Shortcut queued for delivery.')
+
+
+async def privacy(update,context):
+    if not in_private(update): return
+    url=state(context).cfg.privacy_url
+    await update.message.reply_text('🔒 Privacy policy: '+url if url else
+        '🔒 Our support bot retains your messages in a private support group and stores your Telegram ID, support choices and optional game-account details. Contact support for the current public privacy policy. Use /delete_data to request deletion. Staff topic copies may require separate removal.')
+
+
+async def delete_data(update,context):
+    if not in_private(update): return
     await update.message.reply_text(
-        "📋 CUSTOMER INFORMATION\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 Name     : {row['name']}\n🔗 Username : @{row['username'] or 'No username'}\n"
-        f"🆔 ID       : {row['user_id']}\n🎮 Game     : {row['game'] or 'Not selected'}\n"
-        f"🎁 Bonus    : {row['bonus'] or 'Not selected'}\n📊 Source   : {row['source'] or 'Direct/Unknown'}\n"
-        f"📌 Topic ID : {topic_id}\n📅 Joined   : {row['created_at']}\n━━━━━━━━━━━━━━━━━━━━━━━━"
-    )
+        '⚠️ Delete your customer profile, game accounts, notes, and payment records from this bot? This cannot be undone. The bot will attempt to delete its forum topic. Human-held copies may remain.',
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton('Delete my records',callback_data=f'delete:yes:{update.effective_user.id}'),
+            InlineKeyboardButton('Cancel',callback_data=f'delete:no:{update.effective_user.id}')
+        ]]))
 
 
-async def close_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_staff(update):
+async def delete_callback(update,context):
+    q=update.callback_query
+    if not q or not in_private(update): return
+    parts=(q.data or '').split(':')
+    if len(parts)!=3 or not parts[2].isdigit() or int(parts[2])!=update.effective_user.id:
+        await q.answer('This confirmation belongs to a different customer.',show_alert=True)
         return
-    topic_id = update.message.message_thread_id
-    if not topic_id or topic_id == 1:
-        await update.message.reply_text("⚠️ Use /close inside a customer topic.")
+    await q.answer()
+    if parts[1]=='no':
+        await q.edit_message_text('✅ Deletion cancelled.')
         return
-    row = await db_user_by_topic(topic_id)
-    if not row:
-        await update.message.reply_text("❌ No customer connected to this topic.")
+    s=state(context); uid=update.effective_user.id
+    async with s.lock(uid):
+        row=await s.db.user(uid)
+        if not row:
+            await q.edit_message_text('No active customer record found.')
+            return
+        if row['topic_id']:
+            try:
+                await context.bot.delete_forum_topic(chat_id=s.cfg.group_id,message_thread_id=int(row['topic_id']))
+            except TelegramError as exc:
+                # Keep records if we cannot remove the copied messages; manual action needed.
+                log.warning('Customer deletion topic cleanup failed user=%s: %s',uid,exc)
+                await q.edit_message_text('⚠️ Could not delete support topic. Staff must resolve this first. Your database record has NOT been deleted.')
+                return
+        await s.db.delete_user(uid)
+    await q.edit_message_text('✅ Customer records were removed from the bot database and its support topic was deleted (if present). Other copies held outside this bot may remain.')
+
+
+async def optin(update,context):
+    if not in_private(update):return
+    s=state(context)
+    await s.db.upsert_user(update.effective_user)
+    await s.db.opt_in(update.effective_user.id,True)
+    await update.message.reply_text('✅ You opted in to optional service updates. Send /optout anytime.')
+
+
+async def optout(update,context):
+    if not in_private(update):return
+    s=state(context)
+    await s.db.upsert_user(update.effective_user)
+    await s.db.opt_in(update.effective_user.id,False)
+    await update.message.reply_text('✅ Optional messages turned off. Your support chat still works.')
+
+
+async def broadcast(update,context):
+    if not await authorize(update,context,owner_only=True): return
+    args=list(context.args or [])
+    label=None
+    if args and args[0].startswith('--label='):
+        try:label=normalize_label(args.pop(0).split('=',1)[1])
+        except ValueError as exc:
+            await update.message.reply_text(str(exc));return
+    body=' '.join(args).strip()
+    if not body or len(body)>3000:
+        await update.message.reply_text('Usage: /broadcast [--label=VIP] <message> (up to 3000 chars)\nOnly opted-in customers will receive it.')
         return
+    s=state(context)
+    bid,count=await s.db.broadcast_draft(update.effective_user.id,body,label)
+    await update.message.reply_text(
+        f'📡 Broadcast preview #{bid}\nRecipients (opted in): {count}\nLabel: {label or "all"}\n\n{body[:500]}\n\nConfirm?',
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton('Confirm',callback_data=f'bc:yes:{bid}'),
+            InlineKeyboardButton('Cancel',callback_data=f'bc:no:{bid}')]]))
+
+
+async def broadcast_callback(update,context):
+    q=update.callback_query
+    if not q or not in_group(update,state(context)):
+        return
+    s=state(context)
+    if not owner(update,s):
+        await q.answer('Only a bot owner can confirm.',show_alert=True);return
+    parts=(q.data or '').split(':')
+    if len(parts)!=3 or not parts[2].isdigit():return
+    bid=int(parts[2]);ok=parts[1]=='yes'
+    count=await s.db.broadcast_confirm(bid,update.effective_user.id,ok)
+    await q.answer()
+    if count is None:
+        await q.edit_message_text('Draft expired, was already handled, or belongs to another owner.')
+    elif not ok:
+        await q.edit_message_text(f'Broadcast #{bid} cancelled.')
+    else:
+        s.delivery_wakeup.set()
+        await q.edit_message_text(f'✅ Broadcast #{bid} queued for {count} opted-in customers. Check /health for delivery queue stats.')
+
+
+async def error_handler(update,context):
+    log.error('Unhandled Telegram update error: %s',context.error,exc_info=context.error)
+
+
+async def post_init(app):
+    s=app.bot_data['state']
+    s.roles=await s.db.roles()
+    public=[BotCommand('start','Start customer support'),
+            BotCommand('help','Show commands'),BotCommand('games','Choose a game'),
+            BotCommand('support','Reach staff'),BotCommand('privacy','Privacy policy'),
+            BotCommand('delete_data','Delete customer records'),
+            BotCommand('optin','Subscribe to optional updates'),BotCommand('optout','Stop optional updates')]
+    await app.bot.set_my_commands(public)
+    commands=[BotCommand('profile','Customer profile'),BotCommand('id','Customer profile'),
+              BotCommand('setaccount','Save game account'),BotCommand('delaccount','Remove game account'),
+              BotCommand('findaccount','Find saved username'),BotCommand('label','Add VIP or other label'),
+              BotCommand('unlabel','Remove a label'),BotCommand('note','Add staff note'),
+              BotCommand('history','Customer audit log'),BotCommand('status','Change workflow status'),
+              BotCommand('assign','Assign employee'),BotCommand('use','Send saved reply'),
+              BotCommand('shortcuts','List saved replies'),BotCommand('close','Close topic'),
+              BotCommand('stats','Statistics'),BotCommand('staff','Staff list'),
+              BotCommand('deposit','Owner: record a deposit'),BotCommand('broadcast','Owner: opt-in broadcast'),
+              BotCommand('health','Owner: queue health'),BotCommand('addstaff','Owner: add staff'),
+              BotCommand('removestaff','Owner: remove staff'),
+              BotCommand('addshortcut','Owner: create reply'),BotCommand('delshortcut','Owner: remove reply')]
     try:
-        try:
-            await context.bot.send_message(
-                chat_id=int(row["user_id"]),
-                text=f"✅ Your {BRAND} support conversation is closed.\n\nNeed help again? Just send a message!",
-            )
-        except TelegramError:
-            pass
-        await context.bot.close_forum_topic(chat_id=SUPPORT_GROUP_ID, message_thread_id=topic_id)
-        await db_status(int(row["user_id"]), "closed")
-        await update.message.reply_text("✅ Topic closed. Customer dobara message kare to yeh topic reopen hoga.")
-    except TelegramError as error:
-        logger.error("Topic close failed: %s", error)
-        await update.message.reply_text(f"⚠️ Error closing topic: {error}")
+        await app.bot.set_my_commands(commands,scope=BotCommandScopeChat(chat_id=s.cfg.group_id))
+    except TelegramError as exc:
+        log.warning('Could not publish group command menu: %s',exc)
+    s.tasks.append(asyncio.create_task(outbox_worker(app,s),name='persistent-outbox'))
+    if s.cfg.retention_days:
+        s.tasks.append(asyncio.create_task(retention_worker(app,s),name='retention'))
+    log.info('%s bot initialized; active staff=%d',BRAND,len(s.roles))
 
 
-async def add_staff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_staff(update):
-        return
-    args = context.args or []
-    if not args or not args[0].lstrip("-").isdigit():
-        await update.message.reply_text("⚠️ Usage: /addstaff <telegram_id> [name]")
-        return
-    user_id, name = int(args[0]), " ".join(args[1:]) or "Staff"
-    await db_add_staff(user_id, name)
-    AUTHORIZED_STAFF.add(user_id)
-    await update.message.reply_text(f"✅ {name} (ID: {user_id}) ab authorized staff hai.")
+async def post_shutdown(app):
+    s=app.bot_data['state']
+    for task in s.tasks:task.cancel()
+    if s.tasks: await asyncio.gather(*s.tasks,return_exceptions=True)
+    await asyncio.to_thread(s.db.close)
 
 
-async def remove_staff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_staff(update):
-        return
-    args = context.args or []
-    if not args or not args[0].lstrip("-").isdigit():
-        await update.message.reply_text("⚠️ Usage: /removestaff <telegram_id>")
-        return
-    user_id = int(args[0])
-    await db_remove_staff(user_id)
-    AUTHORIZED_STAFF.discard(user_id)
-    await update.message.reply_text(f"✅ ID {user_id} ko staff se remove kar diya.")
+def build_app(cfg=None,db=None):
+    cfg=cfg or Config()
+    cfg.validate()
+    db=db or Database(cfg.db_url)
+    db.migrate()
+    db.seed(cfg.owner_ids,cfg.seed_staff)
+    app=(Application.builder().token(cfg.token).post_init(post_init)
+         .post_shutdown(post_shutdown).concurrent_updates(False).build())
+    app.bot_data['state']=State(cfg,db)
+    private=filters.ChatType.PRIVATE
+    group=filters.Chat(chat_id=cfg.group_id)
+    for command,handler in (
+        ('start',customer_start),('help',help_command),('games',game_list),
+        ('support',support),('privacy',privacy),('delete_data',delete_data),
+        ('optin',optin),('optout',optout)):
+        app.add_handler(CommandHandler(command,handler,filters=private))
+    app.add_handler(CallbackQueryHandler(customer_choice,pattern=r'^(game|bonus):'))
+    app.add_handler(CallbackQueryHandler(delete_callback,pattern=r'^delete:(yes|no):\d+$'))
+    app.add_handler(CallbackQueryHandler(broadcast_callback,pattern=r'^bc:(yes|no):\d+$'))
+    staff_commands={
+        'profile':show_profile,'id':show_profile,'setaccount':cmd_setaccount,
+        'delaccount':cmd_delaccount,'findaccount':find_account,'label':cmd_label,
+        'unlabel':cmd_unlabel,'note':cmd_note,'history':show_history,
+        'status':cmd_status,'assign':cmd_assign,'deposit':cmd_deposit,
+        'close':close_topic,'stats':stats,'health':health,
+        'staff':staff_list,'addstaff':addstaff,'removestaff':removestaff,
+        'shortcuts':shortcut_list,'addshortcut':addshortcut,
+        'delshortcut':delshortcut,'use':use_shortcut,'broadcast':broadcast,
+    }
+    for command,handler in staff_commands.items():
+        app.add_handler(CommandHandler(command,handler,filters=group))
+    app.add_handler(MessageHandler(private & ~filters.COMMAND,customer_message))
+    app.add_handler(MessageHandler(group & ~filters.COMMAND,group_message))
+    app.add_error_handler(error_handler)
+    return app
 
 
-async def staff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await require_staff(update):
-        ids = "\n".join(f"  {item}" for item in sorted(AUTHORIZED_STAFF)) or "  (none)"
-        await update.message.reply_text(f"👥 AUTHORIZED STAFF\n━━━━━━━━━━━━━━━━━━━━━━━━\n{ids}\n━━━━━━━━━━━━━━━━━━━━━━━━")
+def main():
+    app=build_app()
+    log.info('%s starting polling...',BRAND)
+    app.run_polling(allowed_updates=Update.ALL_TYPES,drop_pending_updates=False)
 
 
-# ---------------------- setup ----------------------
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Unhandled error: %s", context.error, exc_info=True)
-
-
-async def post_init(application: Application) -> None:
-    public = [
-        BotCommand("start", "Start or restart your support chat"),
-        BotCommand("help", "Show help and available commands"),
-        BotCommand("games", "Choose or change your game"),
-        BotCommand("support", "Reach the support team"),
-    ]
-    await application.bot.set_my_commands(public)
-    group_commands = public + [
-        BotCommand("id", "Show the customer in this topic"),
-        BotCommand("close", "Close this customer topic"),
-        BotCommand("stats", "Show bot statistics"),
-        BotCommand("broadcast", "Send a customer broadcast"),
-        BotCommand("addstaff", "Authorize a staff member"),
-        BotCommand("removestaff", "Remove a staff member"),
-        BotCommand("staff", "List authorized staff"),
-    ]
-    try:
-        await application.bot.set_my_commands(
-            group_commands, scope=BotCommandScopeChat(chat_id=SUPPORT_GROUP_ID)
-        )
-    except TelegramError as error:
-        logger.warning("Could not set group command menu: %s", error)
-
-
-def main() -> None:
-    print("=" * 46)
-    print(f"       {BRAND.upper()} SUPPORT BOT")
-    print("=" * 46)
-    if not TOKEN:
-        print("❌ BOT_TOKEN not set!")
-        return
-    if not SUPPORT_GROUP_ID:
-        print("❌ SUPPORT_GROUP_ID not set!")
-        return
-    init_db()
-    load_staff()
-    application = Application.builder().token(TOKEN).post_init(post_init).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("games", games))
-    application.add_handler(CommandHandler("support", support))
-    application.add_handler(CallbackQueryHandler(bonus_selected, pattern=r"^bonus:"))
-    application.add_handler(CallbackQueryHandler(game_selected, pattern=r"^game:"))
-    group = filters.Chat(chat_id=SUPPORT_GROUP_ID)
-    application.add_handler(CommandHandler("id", customer_info, filters=group))
-    application.add_handler(CommandHandler("close", close_topic, filters=group))
-    application.add_handler(CommandHandler("stats", stats, filters=group))
-    application.add_handler(CommandHandler("broadcast", broadcast, filters=group))
-    application.add_handler(CommandHandler("addstaff", add_staff, filters=group))
-    application.add_handler(CommandHandler("removestaff", remove_staff, filters=group))
-    application.add_handler(CommandHandler("staff", staff, filters=group))
-    application.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, customer_message))
-    application.add_handler(MessageHandler(group & ~filters.COMMAND, support_group_message))
-    application.add_error_handler(error_handler)
-    print("Bot is running...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
+if __name__=='__main__':
     main()
